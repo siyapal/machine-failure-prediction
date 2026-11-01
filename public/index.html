@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Predictive Maintenance System</title>
+<style>
+:root{--bg:#f4f6fa;--card:#fff;--text:#1c2430;--muted:#667085;--line:#e4e7ec;--accent:#2563eb;--low:#16a34a;--med:#d97706;--high:#dc2626}
+@media(prefers-color-scheme:dark){:root{--bg:#0f141b;--card:#18202b;--text:#e6eaf0;--muted:#98a2b3;--line:#2a3441;--accent:#60a5fa;--low:#4ade80;--med:#fbbf24;--high:#f87171}}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:14px 24px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+h1{font-size:1.15rem;margin:0}h2{font-size:1.05rem;margin:0 0 12px}
+main{max-width:1150px;margin:0 auto;padding:20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:18px}
+.grid{display:grid;gap:14px}.kpis{grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.form{grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}.two{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+.kpi{padding:14px;border:1px solid var(--line);border-radius:10px}.kpi b{display:block;font-size:1.6rem}
+.muted{color:var(--muted);font-size:.88rem}
+label{display:flex;flex-direction:column;gap:4px;font-size:.88rem;font-weight:600}
+label small{font-weight:400;color:var(--muted)}
+input,select,button{font:inherit;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--text)}
+button{cursor:pointer;background:var(--accent);color:#fff;border:0;font-weight:600}
+button.ghost{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+button:disabled{opacity:.6;cursor:wait}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:end;margin-bottom:14px}
+.seg label{flex-direction:row;align-items:center;gap:6px;font-weight:500}
+table{width:100%;border-collapse:collapse;font-size:.88rem}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:600}tr.click{cursor:pointer}tr.click:hover{background:var(--bg)}
+.scroll{overflow-x:auto;max-height:320px;overflow-y:auto}
+.badge{display:inline-block;padding:2px 10px;border-radius:99px;font-weight:700;font-size:.8rem;color:#fff}
+.LOW{background:var(--low)}.MEDIUM{background:var(--med)}.HIGH{background:var(--high)}
+.bar{height:10px;background:var(--line);border-radius:99px;overflow:hidden;margin:8px 0}.bar i{display:block;height:100%}
+.err{color:var(--high);font-size:.9rem;min-height:1.2em}
+#auth{max-width:380px;margin:60px auto}#auth .grid{gap:10px}
+details summary{cursor:pointer;font-weight:600}details ol{margin:8px 0 0;padding-left:20px}
+svg{width:100%;height:auto}
+</style>
+</head>
+<body>
+<header><h1>🛠️ Predictive Maintenance System</h1><div id="who"></div></header>
+<main>
+  <section id="auth" class="card">
+    <h2>Log in</h2>
+    <p class="muted">Check how likely a machine is to fail, and how many days it can still run. Demo account: <b>demo</b> / <b>demo123</b></p>
+    <div class="grid">
+      <label>Username<input id="u" autocomplete="username"></label>
+      <label>Password<input id="p" type="password" autocomplete="current-password"></label>
+      <div class="row" style="margin:0"><button id="login">Log in</button><button id="reg" class="ghost">Create account</button></div>
+      <div id="authMsg" class="err"></div>
+    </div>
+  </section>
+
+  <div id="app" hidden>
+    <div id="banner" class="err"></div>
+    <section class="card">
+      <details open><summary>ℹ️ How to use this app</summary>
+        <ol>
+          <li>Choose <b>Existing machine</b> (pick a machine code, its sensor values load automatically) or <b>New machine</b> (type a new code and enter the values).</li>
+          <li>Change any sensor value if you want, then press <b>Predict</b>.</li>
+          <li>You get a <b>risk level</b>, the <b>failure probability</b> and the <b>remaining useful life (RUL)</b> in days. Every prediction is saved, so the trend and history below keep growing.</li>
+        </ol>
+      </details>
+    </section>
+
+    <section class="card">
+      <h2>Fleet overview</h2>
+      <div class="grid kpis" id="kpis"></div>
+      <p class="muted" style="margin:14px 0 6px">Top 10 machines by failure probability (click a row to open it)</p>
+      <div class="scroll"><div id="fleetTable"></div></div>
+    </section>
+
+    <section class="card">
+      <h2>Predict</h2>
+      <div class="row seg">
+        <label><input type="radio" name="mode" value="existing" checked> Existing machine</label>
+        <label><input type="radio" name="mode" value="new"> New machine</label>
+      </div>
+      <div class="row">
+        <label style="min-width:240px">Machine code <small id="codeHint"></small>
+          <input id="code" list="codes" placeholder="e.g. MC_111754" autocomplete="off"></label>
+        <button id="load" class="ghost">Load machine</button>
+      </div>
+      <datalist id="codes"></datalist>
+      <div class="grid form" id="form"></div>
+      <div class="row" style="margin-top:16px"><button id="predict">🔍 Predict</button><span id="predMsg" class="err"></span></div>
+      <div id="result"></div>
+    </section>
+
+    <section class="card" id="histCard" hidden>
+      <h2>Trend &amp; history for <span id="histCode"></span></h2>
+      <div class="grid two">
+        <div><div class="muted">Failure probability trend</div><div id="chartP"></div></div>
+        <div><div class="muted">RUL trend (days)</div><div id="chartR"></div></div>
+      </div>
+      <p class="muted" style="margin:16px 0 6px">Prediction records</p>
+      <div class="scroll"><div id="histTable"></div></div>
+      <p class="muted" style="margin:16px 0 6px">Access history (who checked this machine, and when)</p>
+      <div class="scroll"><div id="accessTable"></div></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const API = ["localhost", "127.0.0.1", ""].includes(location.hostname) ? "http://127.0.0.1:8000/api" : "/api";
+const store = {
+  get() { try { return localStorage.getItem("pm_user"); } catch { return null; } },
+  set(v) { try { v ? localStorage.setItem("pm_user", v) : localStorage.removeItem("pm_user"); } catch {} }
+};
+
+// key, label, unit, type (int | float | bin), default, hint
+const FIELDS = [
+  ["Operational_Hours", "Operational hours", "h", "int", 50000, "Total hours the machine has run"],
+  ["Temperature_C", "Temperature", "°C", "float", 50, "Current operating temperature"],
+  ["Vibration_mms", "Vibration", "mm/s", "float", 8, "Higher vibration can mean wear or imbalance"],
+  ["Sound_dB", "Sound level", "dB", "float", 70, "Noise level of the machine"],
+  ["Oil_Level_pct", "Oil level", "%", "float", 70, "Remaining oil, in percent"],
+  ["Coolant_Level_pct", "Coolant level", "%", "float", 70, "Remaining coolant, in percent"],
+  ["Power_Consumption_kW", "Power consumption", "kW", "float", 50, "Electric power drawn"],
+  ["Last_Maintenance_Days_Ago", "Days since last maintenance", "days", "int", 180, "Longer gap = higher risk"],
+  ["Maintenance_History_Count", "Past maintenance count", "", "int", 5, "How many times it was serviced"],
+  ["Failure_History_Count", "Past failure count", "", "int", 1, "How many times it failed before"],
+  ["AI_Supervision", "AI supervision", "", "bin", 1, "Is the machine monitored by AI?"],
+  ["Error_Codes_Last_30_Days", "Error codes (last 30 days)", "", "int", 2, "Number of error codes logged"],
+  ["Machine_Age", "Machine age", "years", "int", 5, "Age of the machine"]
+];
+let cfg = null, user = null;
+
+async function api(path, method = "GET", body) {
+  const r = await fetch(API + path, {
+    method, headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  if (!r.ok) {
+    let m = "Request failed (" + r.status + ")";
+    try { const j = await r.json(); m = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail); } catch {}
+    throw new Error(m);
+  }
+  return r.json();
+}
+
+// ---------- login ----------
+async function auth(kind) {
+  const u = $("#u").value.trim(), p = $("#p").value;
+  $("#authMsg").textContent = "";
+  try {
+    if (kind === "register") await api("/register", "POST", { username: u, password: p });
+    await api("/login", "POST", { username: u, password: p });
+    user = u; store.set(u); start();
+  } catch (e) { $("#authMsg").textContent = e.message; }
+}
+$("#login").onclick = () => auth("login");
+$("#reg").onclick = () => auth("register");
+$("#p").onkeydown = e => { if (e.key === "Enter") auth("login"); };
+
+async function start() {
+  $("#auth").hidden = true; $("#app").hidden = false;
+  $("#who").innerHTML = `${esc(user)} <button id="out" class="ghost">Log out</button>`;
+  $("#out").onclick = () => { store.set(null); location.reload(); };
+  try {
+    if (!cfg) { cfg = await api("/config"); buildForm(); }
+    loadFleet(); loadCodes();
+  } catch (e) { $("#banner").textContent = "Could not reach the server: " + e.message; }
+}
+
+// ---------- form ----------
+function buildForm() {
+  let h = `<label>Machine type<select id="f_Machine_Type">${cfg.machine_types.map(t => `<option>${esc(t)}</option>`).join("")}</select></label>`;
+  for (const [k, label, unit, type, , hint] of FIELDS) {
+    h += type === "bin"
+      ? `<label>${label}<select id="f_${k}" title="${esc(hint)}"><option value="1">Yes</option><option value="0">No</option></select><small>${hint}</small></label>`
+      : `<label>${label} ${unit ? `<small>(${unit})</small>` : ""}<input id="f_${k}" type="number" step="${type === "int" ? 1 : "any"}" title="${esc(hint)}"><small>${hint}</small></label>`;
+  }
+  $("#form").innerHTML = h;
+  setFeatures();
+}
+function setFeatures(f) {
+  if (f && f.Machine_Type) $("#f_Machine_Type").value = f.Machine_Type;
+  for (const [k, , , , def] of FIELDS) $("#f_" + k).value = f && f[k] !== undefined ? f[k] : def;
+}
+function getFeatures() {
+  const f = { Machine_Type: $("#f_Machine_Type").value };
+  for (const [k, label, , type] of FIELDS) {
+    const raw = $("#f_" + k).value;
+    const n = type === "float" ? parseFloat(raw) : parseInt(raw, 10);
+    if (Number.isNaN(n)) throw new Error("Please enter a valid number for: " + label);
+    f[k] = n;
+  }
+  return f;
+}
+
+// ---------- mode ----------
+const mode = () => document.querySelector("input[name=mode]:checked").value;
+function onMode() {
+  const ex = mode() === "existing";
+  $("#load").hidden = !ex;
+  $("#codeHint").textContent = ex ? "(pick from the list)" : "(type a new code)";
+  $("#code").placeholder = ex ? "e.g. MC_111754" : "e.g. MC_NEW_001";
+  $("#code").value = ""; if (cfg) setFeatures(); $("#result").innerHTML = ""; $("#histCard").hidden = true;
+}
+document.querySelectorAll("input[name=mode]").forEach(r => r.onchange = onMode);
+$("#load").onclick = () => loadMachine($("#code").value.trim());
+$("#code").onchange = () => { if (mode() === "existing") loadMachine($("#code").value.trim()); };
+
+async function loadMachine(c) {
+  $("#predMsg").textContent = "";
+  if (!c) return;
+  try {
+    setFeatures(await api("/machines/" + encodeURIComponent(c)));
+    loadHistory(c);
+  } catch (e) { $("#predMsg").textContent = e.message; }
+}
+async function loadCodes() {
+  try { $("#codes").innerHTML = (await api("/machines")).map(c => `<option value="${esc(c)}">`).join(""); } catch {}
+}
+
+// ---------- fleet ----------
+function table(heads, rows) {
+  if (!rows.length) return `<p class="muted">No records yet.</p>`;
+  return `<table><thead><tr>${heads.map(h => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table>`;
+}
+const badge = r => `<span class="badge ${esc(r)}">${esc(r)}</span>`;
+const pct = v => v == null ? "N/A" : (v * 100).toFixed(1) + "%";
+const days = v => v == null ? "N/A" : Number(v).toFixed(1);
+
+async function loadFleet() {
+  try {
+    const fl = await api("/fleet");
+    const n = lvl => fl.filter(m => m.risk_level === lvl).length;
+    $("#kpis").innerHTML = [["Machines", fl.length], ["High risk", n("HIGH")], ["Medium risk", n("MEDIUM")], ["Low risk", n("LOW")]]
+      .map(([a, b]) => `<div class="kpi"><span class="muted">${a}</span><b>${b}</b></div>`).join("");
+    const top = [...fl].sort((a, b) => b.failure_probability - a.failure_probability).slice(0, 10);
+    $("#fleetTable").innerHTML = table(["Machine", "Type", "Failure probability", "Risk", "RUL (days)"],
+      top.map(m => `<tr class="click" data-c="${esc(m.machine_code)}"><td>${esc(m.machine_code)}</td><td>${esc(m.machine_type)}</td><td>${pct(m.failure_probability)}</td><td>${badge(m.risk_level)}</td><td>${days(m.predicted_rul_days)}</td></tr>`));
+    document.querySelectorAll("#fleetTable tr.click").forEach(tr => tr.onclick = () => {
+      document.querySelector("input[value=existing]").checked = true; onMode();
+      $("#code").value = tr.dataset.c; loadMachine(tr.dataset.c);
+      $("#code").scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+  } catch (e) { $("#banner").textContent = "Could not load fleet: " + e.message; }
+}
+
+// ---------- predict ----------
+$("#predict").onclick = async () => {
+  const btn = $("#predict"); $("#predMsg").textContent = "";
+  const c = $("#code").value.trim();
+  try {
+    if (!c) throw new Error("Please enter a machine code first.");
+    const features = getFeatures();
+    btn.disabled = true; btn.textContent = "Predicting...";
+    const r = await api("/predict", "POST", { machine_code: c, features });
+    await api("/access_log", "POST", { username: user, machine_code: c });
+    showResult(r); loadHistory(c); loadFleet(); loadCodes();
+  } catch (e) { $("#predMsg").textContent = e.message; }
+  finally { btn.disabled = false; btn.textContent = "🔍 Predict"; }
+};
+function showResult(r) {
+  const col = { LOW: "var(--low)", MEDIUM: "var(--med)", HIGH: "var(--high)" }[r.risk_level];
+  const msg = {
+    LOW: "The machine looks healthy. Continue normal monitoring.",
+    MEDIUM: "Some risk detected. Keep monitoring and plan a maintenance check soon.",
+    HIGH: "High risk of failure. Maintenance check is strongly recommended."
+  }[r.risk_level];
+  $("#result").innerHTML = `<div class="card" style="margin:16px 0 0;border-color:${col}">
+    <div>${badge(r.risk_level)} &nbsp;<b>${msg}</b></div>
+    <div class="bar"><i style="width:${Math.min(100, r.failure_probability * 100)}%;background:${col}"></i></div>
+    <div class="grid kpis">
+      <div class="kpi"><span class="muted">Failure probability</span><b>${pct(r.failure_probability)}</b></div>
+      <div class="kpi"><span class="muted">Failure within 7 days</span><b>${r.failure_within_7_days ? "Yes" : "No"}</b></div>
+      <div class="kpi"><span class="muted">Remaining useful life</span><b>${r.predicted_rul_days == null ? "N/A" : days(r.predicted_rul_days) + " d"}</b></div>
+    </div></div>`;
+}
+
+// ---------- history ----------
+function chart(el, vals, color) {
+  const pts = vals.filter(v => v != null);
+  if (pts.length < 2) { el.innerHTML = `<p class="muted">At least 2 predictions are needed to draw a trend. Press Predict again.</p>`; return; }
+  const w = 520, h = 170, p = 30, min = Math.min(...pts), max = Math.max(...pts), rng = (max - min) || 1;
+  const xy = pts.map((v, i) => [p + i * (w - 2 * p) / (pts.length - 1), h - p - (v - min) / rng * (h - 2 * p)]);
+  el.innerHTML = `<svg viewBox="0 0 ${w} ${h}" role="img">
+    <line x1="${p}" y1="${h - p}" x2="${w - p}" y2="${h - p}" style="stroke:var(--line)"/>
+    <polyline points="${xy.map(q => q.join(",")).join(" ")}" fill="none" style="stroke:${color}" stroke-width="2.5"/>
+    ${xy.map(q => `<circle cx="${q[0]}" cy="${q[1]}" r="3.5" style="fill:${color}"/>`).join("")}
+    <text x="4" y="${p}" font-size="11" style="fill:var(--muted)">${max.toFixed(2)}</text>
+    <text x="4" y="${h - p}" font-size="11" style="fill:var(--muted)">${min.toFixed(2)}</text>
+    <text x="${p}" y="${h - 8}" font-size="11" style="fill:var(--muted)">oldest</text>
+    <text x="${w - p}" y="${h - 8}" font-size="11" text-anchor="end" style="fill:var(--muted)">latest</text></svg>`;
+}
+async function loadHistory(c) {
+  try {
+    const [hist, acc] = await Promise.all([api("/history/" + encodeURIComponent(c)), api("/access_log/" + encodeURIComponent(c))]);
+    $("#histCard").hidden = false; $("#histCode").textContent = c;
+    const old = [...hist].reverse();
+    chart($("#chartP"), old.map(x => x.failure_probability), "var(--accent)");
+    if (old.every(x => x.predicted_rul_days == null)) $("#chartR").innerHTML = `<p class="muted">RUL is not available for this machine.</p>`;
+    else chart($("#chartR"), old.map(x => x.predicted_rul_days), "var(--med)");
+    $("#histTable").innerHTML = table(["Time", "Failure probability", "RUL (days)", "Risk", "Fails in 7 days"],
+      hist.map(x => `<tr><td>${esc(x.created_at)}</td><td>${pct(x.failure_probability)}</td><td>${days(x.predicted_rul_days)}</td><td>${badge(x.risk_level)}</td><td>${x.failure_within_7_days ? "Yes" : "No"}</td></tr>`));
+    $("#accessTable").innerHTML = table(["User", "Checked at"],
+      acc.map(x => `<tr><td>${esc(x.username)}</td><td>${esc(x.checked_at)}</td></tr>`));
+  } catch (e) { $("#banner").textContent = "Could not load history: " + e.message; }
+}
+
+onMode();
+user = store.get();
+if (user) start();
+</script>
+</body>
+</html>

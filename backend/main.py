@@ -1,21 +1,40 @@
-"""FastAPI backend: loads the trained model, stores machines + prediction history in SQLite.
-Run from the project root:  uvicorn backend.main:app --reload
+"""FastAPI backend: loads the trained model, stores machines + prediction history in Postgres (Neon).
+Needs the environment variable DATABASE_URL (Neon connection string).
+
+Local run (from the project root):  uvicorn backend.main:app --reload
+Vercel:  api/index.py imports `app` from here.
+
+All routes work both as /predict (local Streamlit dashboard) and /api/predict (Vercel).
 """
 import hashlib
 import json
 import os
-import sqlite3
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 import joblib
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+import psycopg2
+from fastapi import APIRouter, FastAPI, HTTPException
+from psycopg2.extras import RealDictCursor
 from pydantic import BaseModel
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Optional: lets you keep DATABASE_URL in a local .env file (not needed on Vercel).
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(ROOT / ".env")
+except ImportError:
+    pass
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set. Add your Neon connection string as an environment variable.")
+
 MODELS_DIR = next(p for p in ROOT.iterdir() if p.is_dir() and p.name.lower() == "models")
-DB_PATH = Path(os.environ.get("DB_PATH", ROOT / "machines.db"))
 
 model = joblib.load(MODELS_DIR / "model.pkl")
 with open(MODELS_DIR / "config.json") as f:
@@ -23,7 +42,7 @@ with open(MODELS_DIR / "config.json") as f:
 THRESHOLD = config["threshold"]
 
 # Optional: a second model that predicts remaining useful life (RUL) in days.
-# If models/rul_model.pkl does not exist, RUL is simply returned as null.
+# If Models/rul_model.pkl does not exist, RUL is simply returned as null.
 RUL_PATH = MODELS_DIR / "rul_model.pkl"
 rul_model = joblib.load(RUL_PATH) if RUL_PATH.exists() else None
 
@@ -60,10 +79,27 @@ class AccessIn(BaseModel):
     machine_code: str
 
 
+# ---------------------------------------------------------------- database
+@contextmanager
 def db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+    """Yields a cursor (rows come back as dicts). Commits on success, rolls back on error, always closes."""
+    con = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor, connect_timeout=10)
+    try:
+        cur = con.cursor()
+        yield cur
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+UPSERT_MACHINE = """INSERT INTO machines (machine_code, data) VALUES (%s, %s)
+                    ON CONFLICT (machine_code) DO UPDATE SET data = EXCLUDED.data"""
+
+INSERT_PREDICTION = """INSERT INTO predictions (machine_code, predicted_rul_days, failure_probability,
+                       failure_within_7_days, risk_level, created_at) VALUES (%s,%s,%s,%s,%s,%s)"""
 
 
 def _hash(pw, salt=None):
@@ -73,30 +109,48 @@ def _hash(pw, salt=None):
 
 
 def init_db():
-    with db() as con:
-        con.execute("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL)")
-        con.execute("""CREATE TABLE IF NOT EXISTS access_log (
-            log_id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, machine_code TEXT NOT NULL,
-            checked_at TEXT NOT NULL)""")
-        con.execute("CREATE TABLE IF NOT EXISTS machines (machine_code TEXT PRIMARY KEY, data TEXT NOT NULL)")
-        con.execute("""CREATE TABLE IF NOT EXISTS predictions (
-            prediction_id INTEGER PRIMARY KEY AUTOINCREMENT, machine_code TEXT NOT NULL,
-            predicted_rul_days REAL, failure_probability REAL, failure_within_7_days INTEGER,
-            risk_level TEXT, created_at TEXT NOT NULL)""")
-        if con.execute("SELECT COUNT(*) FROM machines").fetchone()[0] == 0:
-            demo = dict(Machine_Type=config["machine_types"][0], Operational_Hours=50000,
-                        Temperature_C=50.0, Vibration_mms=8.0, Sound_dB=70.0, Oil_Level_pct=70.0,
-                        Coolant_Level_pct=70.0, Power_Consumption_kW=50.0,
-                        Last_Maintenance_Days_Ago=180, Maintenance_History_Count=5,
-                        Failure_History_Count=1, AI_Supervision=1,
-                        Error_Codes_Last_30_Days=2, Machine_Age=5)
-            con.execute("INSERT INTO machines VALUES (?, ?)", ("MC_TEST_001", json.dumps(demo)))
+    try:
+        with db() as cur:
+            cur.execute("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL)")
+            cur.execute("""CREATE TABLE IF NOT EXISTS access_log (
+                log_id SERIAL PRIMARY KEY, username TEXT NOT NULL, machine_code TEXT NOT NULL,
+                checked_at TEXT NOT NULL)""")
+            cur.execute("CREATE TABLE IF NOT EXISTS machines (machine_code TEXT PRIMARY KEY, data TEXT NOT NULL)")
+            cur.execute("""CREATE TABLE IF NOT EXISTS predictions (
+                prediction_id SERIAL PRIMARY KEY, machine_code TEXT NOT NULL,
+                predicted_rul_days DOUBLE PRECISION, failure_probability DOUBLE PRECISION,
+                failure_within_7_days INTEGER, risk_level TEXT, created_at TEXT NOT NULL)""")
+            cur.execute("SELECT COUNT(*) AS n FROM machines")
+            if cur.fetchone()["n"] == 0:
+                demo = dict(Machine_Type=config["machine_types"][0], Operational_Hours=50000,
+                            Temperature_C=50.0, Vibration_mms=8.0, Sound_dB=70.0, Oil_Level_pct=70.0,
+                            Coolant_Level_pct=70.0, Power_Consumption_kW=50.0,
+                            Last_Maintenance_Days_Ago=180, Maintenance_History_Count=5,
+                            Failure_History_Count=1, AI_Supervision=1,
+                            Error_Codes_Last_30_Days=2, Machine_Age=5)
+                cur.execute("INSERT INTO machines (machine_code, data) VALUES (%s, %s) "
+                            "ON CONFLICT (machine_code) DO NOTHING", ("MC_TEST_001", json.dumps(demo)))
+    except Exception as e:  # e.g. two cold starts creating tables at the same moment
+        print("init_db warning:", e)
+
+
+def ensure_demo_user():
+    """Public demo account so visitors can always log in."""
+    try:
+        with db() as cur:
+            cur.execute("SELECT 1 FROM users WHERE username = 'demo'")
+            if not cur.fetchone():
+                cur.execute("INSERT INTO users (username, password_hash) VALUES (%s, %s) "
+                            "ON CONFLICT (username) DO NOTHING", ("demo", _hash("demo123")))
+    except Exception as e:
+        print("ensure_demo_user warning:", e)
 
 
 init_db()
-app = FastAPI(title="Predictive Maintenance API")
+ensure_demo_user()
 
 
+# ---------------------------------------------------------------- model
 def run_model(features: dict) -> dict:
     row = pd.DataFrame([features])[config["features"]]
     prob = float(model.predict_proba(row)[0, 1])
@@ -109,10 +163,15 @@ def run_model(features: dict) -> dict:
 
 
 def seed_demo_data(n=300):
-    """On a fresh server (empty database) load n real machines from the dataset and store one prediction each.
-    Needed on hosts like Render free tier where the database file is wiped on every restart."""
-    with db() as con:
-        if con.execute("SELECT COUNT(*) FROM predictions").fetchone()[0] > 0:
+    """Load n real machines from the dataset and store one prediction each.
+    NOT called automatically (Vercel does not have the Data folder).
+    Run it once from your laptop, with DATABASE_URL pointing to Neon:
+        python -c "from backend.main import seed_demo_data; seed_demo_data(300)"
+    """
+    with db() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM predictions")
+        if cur.fetchone()["n"] > 0:
+            print("Predictions table already has data, seeding skipped")
             return
     try:
         data_dir = next(p for p in ROOT.iterdir() if p.is_dir() and p.name.lower() == "data")
@@ -121,81 +180,74 @@ def seed_demo_data(n=300):
         ids = pd.read_csv(raw, usecols=["Machine_ID"])["Machine_ID"]
         clean = pd.read_csv(cleaned, usecols=config["features"])
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with db() as con:
+        with db() as cur:
             for i in clean.sample(n, random_state=42).index:
                 feats = json.loads(clean.loc[[i], config["features"]].to_json(orient="records"))[0]
                 res = run_model(feats)
                 code = str(ids[i])
-                con.execute("INSERT OR REPLACE INTO machines VALUES (?, ?)", (code, json.dumps(feats)))
-                con.execute("""INSERT INTO predictions (machine_code, predicted_rul_days, failure_probability,
-                               failure_within_7_days, risk_level, created_at) VALUES (?,?,?,?,?,?)""",
+                cur.execute(UPSERT_MACHINE, (code, json.dumps(feats)))
+                cur.execute(INSERT_PREDICTION,
                             (code, res["predicted_rul_days"], res["failure_probability"],
                              int(res["failure_within_7_days"]), res["risk_level"], now))
         print(f"Seeded {n} demo machines")
-    except Exception as e:  # never stop the server because of seeding
+    except Exception as e:
         print("Seeding skipped:", e)
 
 
-def ensure_demo_user():
-    """Public demo account so visitors can log in even after the free server restarts."""
-    with db() as con:
-        if not con.execute("SELECT 1 FROM users WHERE username = 'demo'").fetchone():
-            con.execute("INSERT INTO users VALUES (?, ?)", ("demo", _hash("demo123")))
+# ---------------------------------------------------------------- routes
+router = APIRouter()
 
 
-seed_demo_data()
-ensure_demo_user()
-
-
-@app.get("/")
+@router.get("/")
 def root():
     return {"status": "ok"}
 
 
-@app.get("/config")
+@router.get("/config")
 def get_config():
     return config
 
 
-@app.get("/machines")
+@router.get("/machines")
 def list_machines():
-    with db() as con:
-        return [r["machine_code"] for r in con.execute("SELECT machine_code FROM machines ORDER BY machine_code")]
+    with db() as cur:
+        cur.execute("SELECT machine_code FROM machines ORDER BY machine_code")
+        return [r["machine_code"] for r in cur.fetchall()]
 
 
-@app.get("/machines/{code}")
+@router.get("/machines/{code}")
 def get_machine(code: str):
-    with db() as con:
-        r = con.execute("SELECT data FROM machines WHERE machine_code = ?", (code,)).fetchone()
+    with db() as cur:
+        cur.execute("SELECT data FROM machines WHERE machine_code = %s", (code,))
+        r = cur.fetchone()
     if r is None:
         raise HTTPException(404, "Machine not found")
     return json.loads(r["data"])
 
 
-@app.post("/predict")
+@router.post("/predict")
 def predict(req: PredictRequest):
     feats = req.features.model_dump()
     if feats["Machine_Type"] not in config["machine_types"]:
         raise HTTPException(422, "Unknown machine type")
     result = run_model(feats)
-    with db() as con:
-        con.execute("INSERT OR REPLACE INTO machines VALUES (?, ?)", (req.machine_code, json.dumps(feats)))
-        con.execute("""INSERT INTO predictions (machine_code, predicted_rul_days, failure_probability,
-                       failure_within_7_days, risk_level, created_at) VALUES (?,?,?,?,?,?)""",
+    with db() as cur:
+        cur.execute(UPSERT_MACHINE, (req.machine_code, json.dumps(feats)))
+        cur.execute(INSERT_PREDICTION,
                     (req.machine_code, result["predicted_rul_days"], result["failure_probability"],
                      int(result["failure_within_7_days"]), result["risk_level"],
                      datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     return result
 
 
-@app.get("/fleet")
+@router.get("/fleet")
 def fleet():
-    with db() as con:
-        rows = con.execute("""SELECT p.machine_code, p.failure_probability, p.risk_level,
+    with db() as cur:
+        cur.execute("""SELECT p.machine_code, p.failure_probability, p.risk_level,
                 p.predicted_rul_days, p.created_at, m.data
             FROM predictions p JOIN machines m ON m.machine_code = p.machine_code
-            WHERE p.prediction_id IN (SELECT MAX(prediction_id) FROM predictions GROUP BY machine_code)"""
-        ).fetchall()
+            WHERE p.prediction_id IN (SELECT MAX(prediction_id) FROM predictions GROUP BY machine_code)""")
+        rows = cur.fetchall()
     return [{"machine_code": r["machine_code"],
              "machine_type": json.loads(r["data"])["Machine_Type"],
              "failure_probability": r["failure_probability"], "risk_level": r["risk_level"],
@@ -203,47 +255,59 @@ def fleet():
             for r in rows]
 
 
-@app.get("/history/{code}")
+@router.get("/history/{code}")
 def history(code: str):
-    with db() as con:
-        rows = con.execute("SELECT * FROM predictions WHERE machine_code = ? ORDER BY prediction_id DESC",
-                           (code,)).fetchall()
+    with db() as cur:
+        cur.execute("SELECT * FROM predictions WHERE machine_code = %s ORDER BY prediction_id DESC", (code,))
+        rows = cur.fetchall()
     return [dict(r) for r in rows]
 
 
-@app.post("/register")
+@router.post("/register")
 def register(a: AuthIn):
     username = a.username.strip()
     if not username or not a.password:
         raise HTTPException(422, "Username and password required")
-    with db() as con:
-        if con.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
+    with db() as cur:
+        cur.execute("SELECT 1 FROM users WHERE username = %s", (username,))
+        if cur.fetchone():
             raise HTTPException(400, "Username already exists")
-        con.execute("INSERT INTO users VALUES (?, ?)", (username, _hash(a.password)))
+        cur.execute("INSERT INTO users (username, password_hash) VALUES (%s, %s)", (username, _hash(a.password)))
     return {"ok": True}
 
 
-@app.post("/login")
+@router.post("/login")
 def login(a: AuthIn):
     username = a.username.strip()
-    with db() as con:
-        row = con.execute("SELECT password_hash FROM users WHERE username = ?", (username,)).fetchone()
+    with db() as cur:
+        cur.execute("SELECT password_hash FROM users WHERE username = %s", (username,))
+        row = cur.fetchone()
     if not row or _hash(a.password, row["password_hash"].split("$")[0]) != row["password_hash"]:
         raise HTTPException(401, "Wrong username or password")
     return {"ok": True}
 
 
-@app.post("/access_log")
+@router.post("/access_log")
 def add_access(a: AccessIn):
-    with db() as con:
-        con.execute("INSERT INTO access_log (username, machine_code, checked_at) VALUES (?,?,?)",
+    with db() as cur:
+        cur.execute("INSERT INTO access_log (username, machine_code, checked_at) VALUES (%s,%s,%s)",
                     (a.username, a.machine_code, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     return {"ok": True}
 
 
-@app.get("/access_log/{code}")
+@router.get("/access_log/{code}")
 def get_access(code: str):
-    with db() as con:
-        rows = con.execute("SELECT username, machine_code, checked_at FROM access_log "
-                           "WHERE machine_code = ? ORDER BY log_id DESC", (code,)).fetchall()
+    with db() as cur:
+        cur.execute("SELECT username, machine_code, checked_at FROM access_log "
+                    "WHERE machine_code = %s ORDER BY log_id DESC", (code,))
+        rows = cur.fetchall()
     return [dict(r) for r in rows]
+
+
+app = FastAPI(title="Predictive Maintenance API")
+app.include_router(router, include_in_schema=False)  # /predict ... (local Streamlit dashboard)
+app.include_router(router, prefix="/api")            # /api/predict ... (Vercel + new frontend)
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
