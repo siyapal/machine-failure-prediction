@@ -1,4 +1,1 @@
-{
-  "rewrites": [{ "source": "/api/(.*)", "destination": "/api/index" }],
-  "functions": { "api/index.py": { "includeFiles": "{Models,backend}/**" } }
-}
+{}
